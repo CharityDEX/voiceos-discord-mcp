@@ -1,0 +1,23 @@
+{
+  "name": "voiceos-discord-mcp",
+  "version": "1.0.0",
+  "description": "Discord MCP server integration for VoiceOS.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "tsx index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "latest",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "tsx": "latest",
+    "typescript": "latest"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
