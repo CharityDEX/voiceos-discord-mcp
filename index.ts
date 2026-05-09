@@ -1,21 +1,36 @@
+import { Composio } from "@composio/core";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { spawn } from "node:child_process";
 import { z } from "zod";
 
-const DISCORD_API_BASE_URL =
-  process.env.DISCORD_API_BASE ?? "https://discord.com/api/v10";
 const DEFAULT_MESSAGE_LIMIT = 10;
 const MAX_MESSAGE_LIMIT = 100;
+const DISCORD_BOT_TOOLKIT = process.env.COMPOSIO_TOOLKIT ?? "DISCORDBOT";
+const COMPOSIO_TOOLKIT_SLUG = DISCORD_BOT_TOOLKIT.toLowerCase();
+const COMPOSIO_AUTH_CONFIG_ID = process.env.COMPOSIO_AUTH_CONFIG_ID;
+const AUTO_OPEN_AUTH_BROWSER =
+  process.env.OPEN_COMPOSIO_AUTH_BROWSER !== "false";
 
-const botToken = process.env.DISCORD_BOT_TOKEN;
 const configuredGuildIds = (process.env.DISCORD_GUILD_IDS ?? "")
   .split(",")
   .map((guildId) => guildId.trim())
   .filter(Boolean);
 
-if (!botToken) {
-  throw new Error("DISCORD_BOT_TOKEN environment variable is required.");
+const composioApiKey = process.env.COMPOSIO_API_KEY;
+const voiceOsUserId = process.env.VOICEOS_USER_ID;
+
+if (!composioApiKey) {
+  throw new Error("COMPOSIO_API_KEY environment variable is required.");
 }
+
+if (!voiceOsUserId) {
+  throw new Error(
+    "VOICEOS_USER_ID environment variable is required for local testing. Production VoiceOS should inject the logged-in user's internal ID automatically."
+  );
+}
+
+const composioUserId = voiceOsUserId;
 
 type DiscordUser = {
   id: string;
@@ -51,12 +66,6 @@ type DiscordMessage = {
   referenced_message?: DiscordMessage | null;
 };
 
-type DiscordApiError = {
-  message?: string;
-  code?: number;
-  errors?: unknown;
-};
-
 type DiscordGuild = {
   id: string;
   name: string;
@@ -82,44 +91,25 @@ const mentionPolicySchema = z
     "Allowed Discord mention parsing policy. Use 'none' unless the user explicitly asks to ping users, roles, @everyone, or @here."
   );
 
-async function discordRequest<T>(
-  path: string,
-  options: RequestInit = {}
-): Promise<T> {
-  const response = await fetch(`${DISCORD_API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bot ${botToken}`,
-      "Content-Type": "application/json",
-      "User-Agent": "VoiceOS-Discord-MCP (https://voiceos.com, 1.0.0)",
-      ...options.headers,
-    },
-  });
+const composio = new Composio({
+  apiKey: composioApiKey,
+  host: "voiceos-discord-mcp",
+});
 
-  if (!response.ok) {
-    let errorBody: DiscordApiError | string;
+let sessionPromise: ReturnType<typeof composio.create> | undefined;
 
-    try {
-      errorBody = (await response.json()) as DiscordApiError;
-    } catch {
-      errorBody = await response.text();
-    }
+function getSession() {
+  const sessionConfig = {
+    toolkits: [COMPOSIO_TOOLKIT_SLUG],
+    ...(COMPOSIO_AUTH_CONFIG_ID
+      ? { authConfigs: { [COMPOSIO_TOOLKIT_SLUG]: COMPOSIO_AUTH_CONFIG_ID } }
+      : {}),
+    manageConnections: true,
+  };
 
-    const errorMessage =
-      typeof errorBody === "string"
-        ? errorBody
-        : errorBody.message ?? JSON.stringify(errorBody);
+  sessionPromise ??= composio.create(composioUserId, sessionConfig);
 
-    throw new Error(
-      `Discord API request failed (${response.status} ${response.statusText}): ${errorMessage}`
-    );
-  }
-
-  if (response.status === 204) {
-    return undefined as T;
-  }
-
-  return (await response.json()) as T;
+  return sessionPromise;
 }
 
 function clampMessageLimit(limit: number): number {
@@ -207,6 +197,259 @@ function allowedMentionsForPolicy(policy: z.infer<typeof mentionPolicySchema>) {
   }
 }
 
+type ComposioExecutionData = Record<string, unknown>;
+
+type ConnectionReady = {
+  type: "ready";
+};
+
+type NeedsAuthLink = {
+  type: "needs_auth";
+  text: string;
+};
+
+type ConnectionState = ConnectionReady | NeedsAuthLink;
+
+function textResponse(text: string, isError = false) {
+  return {
+    content: [{ type: "text" as const, text }],
+    isError,
+  };
+}
+
+function stringifyData(data: unknown): string {
+  if (typeof data === "string") {
+    return data;
+  }
+
+  return JSON.stringify(data, null, 2);
+}
+
+function normalizeComposioConnectUrl(url: string): string {
+  return url
+    .replace("https://connect.composio.dev", "https://platform.composio.dev")
+    .replace("http://connect.composio.dev", "https://platform.composio.dev")
+    .replace("https://connect..dev", "https://platform.composio.dev")
+    .replace("http://connect..dev", "https://platform.composio.dev")
+    .replace("https://connect.dev", "https://platform.composio.dev")
+    .replace("http://connect.dev", "https://platform.composio.dev");
+}
+
+function openUrlInBrowser(url: string): boolean {
+  if (!AUTO_OPEN_AUTH_BROWSER) {
+    return false;
+  }
+
+  const command =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "cmd"
+        : "xdg-open";
+  const args =
+    process.platform === "win32" ? ["/c", "start", "", url] : [url];
+
+  try {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatConnectLinkMessage(redirectUrl: string, openedBrowser: boolean): string {
+  return [
+    "Discord is connected to VoiceOS, but your Discord bot/account connection is not authenticated in Composio yet.",
+    "",
+    openedBrowser
+      ? "I opened the Composio Discord connection page in your browser."
+      : "I could not open the Composio Discord connection page automatically.",
+    "",
+    "I am intentionally not printing the Composio URL because VoiceOS link handling has been corrupting Composio hostnames in chat.",
+    "",
+    "After completing authentication, retry your Discord request.",
+  ].join("\n");
+}
+
+function formatAuthRequiredMessage(details?: string): string {
+  return [
+    details ?? "Discord Bot authentication is required before I can access Discord.",
+    "",
+    "I will not open Composio automatically for normal Discord requests, to avoid an auth retry loop.",
+    "",
+    "Please explicitly ask: `Connect Discord` when you want me to open the Composio connection page.",
+    "",
+    "After completing authentication, retry your Discord request.",
+  ].join("\n");
+}
+
+function formatInvalidDiscordBotAuthMessage({
+  statusCode,
+  errorBody,
+  authConfigId,
+  connectedAccountId,
+  isComposioManaged,
+}: {
+  statusCode?: number;
+  errorBody?: string;
+  authConfigId?: string;
+  connectedAccountId?: string;
+  isComposioManaged?: boolean;
+}): string {
+  const configHint = COMPOSIO_AUTH_CONFIG_ID
+    ? `The MCP is configured to use Composio auth config ${COMPOSIO_AUTH_CONFIG_ID}.`
+    : "The MCP is not configured with COMPOSIO_AUTH_CONFIG_ID, so Composio is falling back to its default managed OAuth connection.";
+
+  const managedHint = isComposioManaged
+    ? [
+        "The active Composio connection is Composio-managed OAuth. For the DISCORDBOT channel/message tools, that is not enough by itself: the auth config must include the Discord bot token.",
+        "",
+        "Create or select a custom DISCORDBOT auth config in Composio that includes the Discord client ID, client secret, bot token, and permission integer, then set COMPOSIO_AUTH_CONFIG_ID in this MCP environment.",
+      ].join("\n")
+    : "Reconnect the configured DISCORDBOT auth config and confirm it includes a valid Discord bot token.";
+
+  return formatAuthRequiredMessage(
+    [
+      "Composio says Discord Bot is connected, but the actual bot-token check fails.",
+      "",
+      `Discord auth status: ${statusCode ?? "unknown"}`,
+      errorBody ? `Discord error: ${errorBody}` : undefined,
+      authConfigId ? `Active auth config: ${authConfigId}` : undefined,
+      connectedAccountId ? `Active connected account: ${connectedAccountId}` : undefined,
+      "",
+      configHint,
+      "",
+      managedHint,
+    ]
+      .filter(Boolean)
+      .join("\n")
+  );
+}
+
+async function createDiscordConnectLink(): Promise<string> {
+  const connectionRequest = COMPOSIO_AUTH_CONFIG_ID
+    ? await composio.toolkits.authorize(
+        composioUserId,
+        COMPOSIO_TOOLKIT_SLUG,
+        COMPOSIO_AUTH_CONFIG_ID
+      )
+    : await (await getSession()).authorize(COMPOSIO_TOOLKIT_SLUG);
+  const redirectUrl = connectionRequest.redirectUrl
+    ? normalizeComposioConnectUrl(connectionRequest.redirectUrl)
+    : null;
+
+  if (!redirectUrl) {
+    throw new Error(
+      "Composio did not return a Discord connect link. Check the DISCORDBOT auth configuration in Composio."
+    );
+  }
+
+  return redirectUrl;
+}
+
+async function ensureDiscordBotConnection(): Promise<ConnectionState> {
+  const session = await getSession();
+  const toolkits = await session.toolkits({
+    toolkits: [COMPOSIO_TOOLKIT_SLUG],
+  });
+
+  const discordToolkit = toolkits.items.find(
+    (toolkit) => toolkit.slug.toLowerCase() === COMPOSIO_TOOLKIT_SLUG
+  );
+
+  if (discordToolkit?.connection?.isActive) {
+    const authTest = await session.execute("DISCORDBOT_TEST_AUTH", {});
+    const authData = authTest.data as {
+      auth_ok?: boolean;
+      status_code?: number;
+      error_body?: string;
+    };
+
+    if (authTest.error || authData.auth_ok === false) {
+      return {
+        type: "needs_auth",
+        text: formatInvalidDiscordBotAuthMessage({
+          statusCode: authData.status_code,
+          errorBody: authData.error_body,
+          authConfigId: discordToolkit.connection.authConfig?.id,
+          connectedAccountId: discordToolkit.connection.connectedAccount?.id,
+          isComposioManaged:
+            discordToolkit.connection.authConfig?.isComposioManaged,
+        }),
+      };
+    }
+
+    return { type: "ready" };
+  }
+
+  return {
+    type: "needs_auth",
+    text: formatAuthRequiredMessage(),
+  };
+}
+
+async function executeDiscordBotTool(
+  toolSlug: string,
+  args: Record<string, unknown>
+): Promise<ComposioExecutionData> {
+  const session = await getSession();
+  const result = await session.execute(toolSlug, args);
+
+  if (result.error) {
+    throw new Error(`Composio ${toolSlug} failed: ${result.error}`);
+  }
+
+  return result.data;
+}
+
+function extractArray<T>(data: unknown): T[] {
+  if (Array.isArray(data)) {
+    return data as T[];
+  }
+
+  if (data && typeof data === "object") {
+    const record = data as Record<string, unknown>;
+    const candidates = [
+      record.data,
+      record.items,
+      record.messages,
+      record.channels,
+      record.guilds,
+      record.result,
+    ];
+
+    for (const candidate of candidates) {
+      if (Array.isArray(candidate)) {
+        return candidate as T[];
+      }
+    }
+
+    if (record.data && typeof record.data === "object") {
+      return extractArray<T>(record.data);
+    }
+  }
+
+  return [];
+}
+
+function extractObject<T extends Record<string, unknown>>(data: unknown): T | null {
+  if (!data || typeof data !== "object") {
+    return null;
+  }
+
+  const record = data as Record<string, unknown>;
+
+  if (record.data && typeof record.data === "object" && !Array.isArray(record.data)) {
+    return record.data as T;
+  }
+
+  return record as T;
+}
+
 function formatChannelType(type: number): string {
   const channelTypes: Record<number, string> = {
     0: "text",
@@ -246,8 +489,58 @@ function formatChannel(channel: DiscordChannel): string {
   return details.join("\n");
 }
 
-async function listBotGuilds(): Promise<DiscordGuild[]> {
-  return discordRequest<DiscordGuild[]>("/users/@me/guilds");
+function normalizeChannelName(name: string): string {
+  return name.trim().replace(/^#/, "").toLowerCase();
+}
+
+async function listGuildChannels(guildId: string): Promise<DiscordChannel[]> {
+  const data = await executeDiscordBotTool("DISCORDBOT_LIST_GUILD_CHANNELS", {
+    guild_id: guildId,
+  });
+
+  return extractArray<DiscordChannel>(data);
+}
+
+async function resolveChannelId({
+  channelId,
+  channelName,
+  guildId,
+}: {
+  channelId?: string;
+  channelName?: string;
+  guildId?: string;
+}): Promise<string | null> {
+  if (channelId) {
+    return channelId;
+  }
+
+  if (!channelName) {
+    return null;
+  }
+
+  const guildIds = guildId ? [guildId] : configuredGuildIds;
+
+  if (guildIds.length === 0) {
+    return null;
+  }
+
+  const targetName = normalizeChannelName(channelName);
+
+  for (const currentGuildId of guildIds) {
+    const channels = await listGuildChannels(currentGuildId);
+    const match = channels.find(
+      (channel) =>
+        channel.name &&
+        isTextLikeChannel(channel) &&
+        normalizeChannelName(channel.name) === targetName
+    );
+
+    if (match) {
+      return match.id;
+    }
+  }
+
+  return null;
 }
 
 const server = new McpServer({
@@ -256,82 +549,101 @@ const server = new McpServer({
 });
 
 /**
- * ## Future Discord OAuth Architecture
+ * ## Composio DISCORDBOT Architecture
  *
- * The current local MCP server uses `DISCORD_BOT_TOKEN`. For a seamless
- * VoiceOS "Connect Discord" flow, VoiceOS should own a first-party Discord
- * application and bot:
+ * This local MCP server keeps VoiceOS's stdio launch-command model, but delegates
+ * Discord auth and tool execution to Composio's DISCORDBOT toolkit. Production
+ * VoiceOS should inject its internal logged-in user ID as the Composio user_id;
+ * local testing uses VOICEOS_USER_ID.
  *
- * 1. User clicks "Connect Discord" in VoiceOS settings.
- * 2. VoiceOS opens Discord OAuth2 with scopes: `bot`, `identify`, and `guilds`.
- * 3. User selects a server and authorizes the VoiceOS bot with permissions:
- *    `View Channels`, `Read Message History`, and `Send Messages`.
- * 4. Discord redirects to the VoiceOS backend OAuth callback.
- * 5. VoiceOS stores the Discord user ID, guild installation metadata, and any
- *    setup OAuth tokens. The first-party bot token stays in VoiceOS secret
- *    storage, not on the user's device.
- * 6. The VoiceOS MCP runtime calls Discord through the managed bot installation.
- *
- * Discord's `messages.read` scope does not replace bot permissions for normal
- * server/channel access. For this use case, bot installation plus least-privilege
- * channel permissions is the recommended architecture.
+ * NOTE: Composio DISCORDBOT supports bot-accessible channel messaging,
+ * message reads, replies, guild channel listing, and bot-created DMs.
+ * It does not grant broad access to a user's existing personal DMs.
+ * Group DM operations require user OAuth2 access tokens with gdm.join and
+ * remain constrained by Discord API limitations.
  */
 
 server.tool(
-  "list_discord_servers",
-  "List Discord servers/guilds that the bot can see. Use this when the user asks what Discord servers are connected or available.",
+  "connect_discord_bot",
+  "Create a Composio Connect Link for authenticating the Discord bot/account connection. Use this whenever the user asks to connect Discord, or whenever another Discord tool reports that authentication is required.",
   {},
   async () => {
-    const guilds = await listBotGuilds();
+    const redirectUrl = await createDiscordConnectLink();
+    const openedBrowser = openUrlInBrowser(redirectUrl);
+    return textResponse(formatConnectLinkMessage(redirectUrl, openedBrowser));
+  }
+);
 
-    const text =
-      guilds.length > 0
-        ? guilds.map(formatGuild).join("\n\n---\n\n")
-        : "No Discord servers found for this bot. Make sure the bot has been invited to a server.";
+server.tool(
+  "list_discord_servers",
+  "Explain how to list Discord servers/guilds for this Composio DISCORDBOT integration. DISCORDBOT channel discovery requires a guild/server ID; if authentication is missing, this returns a Composio Connect Link.",
+  {},
+  async () => {
+    const connection = await ensureDiscordBotConnection();
 
-    return {
-      content: [{ type: "text", text }],
-    };
+    if (connection.type === "needs_auth") {
+      return textResponse(connection.text);
+    }
+
+    if (configuredGuildIds.length > 0) {
+      const guilds = await Promise.all(
+        configuredGuildIds.map(async (guildId) => {
+          const data = await executeDiscordBotTool("DISCORDBOT_GET_GUILD", {
+            guild_id: guildId,
+            with_counts: false,
+          });
+          return extractObject<DiscordGuild>(data) ?? { id: guildId, name: "Unknown" };
+        })
+      );
+
+      return textResponse(guilds.map(formatGuild).join("\n\n---\n\n"));
+    }
+
+    return textResponse(
+      [
+        "The Composio DISCORDBOT toolkit can list channels for a known Discord server/guild ID, but it does not expose a general bot guild-list tool in the current mapped MCP implementation.",
+        "",
+        "Set DISCORD_GUILD_IDS in the MCP .env file or provide a guild ID when asking to list channels.",
+      ].join("\n")
+    );
   }
 );
 
 server.tool(
   "list_discord_channels",
-  "List Discord channels that the bot can discover. Provide a server/guild ID when known. If no server ID is provided, this tool uses DISCORD_GUILD_IDS from the environment or tries to list all bot servers first. Use this when the user asks what Discord channels or chats are available.",
+  "List Discord channels that the Composio DISCORDBOT connection can discover. Provide a server/guild ID when known. If authentication is missing, return a Composio Connect Link. Use this when the user asks what Discord channels or chats are available.",
   {
     guild_id: z
       .string()
       .optional()
-      .describe("Optional Discord server/guild ID. If omitted, uses DISCORD_GUILD_IDS or all bot servers."),
+      .describe("Optional Discord server/guild ID. If omitted, uses DISCORD_GUILD_IDS from the MCP environment."),
     text_only: z
       .boolean()
       .default(true)
       .describe("Only return text-like channels that can be used for reading or sending messages. Defaults to true."),
   },
   async ({ guild_id, text_only = true }) => {
+    const connection = await ensureDiscordBotConnection();
+
+    if (connection.type === "needs_auth") {
+      return textResponse(connection.text);
+    }
+
     let guildIds = guild_id ? [guild_id] : configuredGuildIds;
 
     if (guildIds.length === 0) {
-      const guilds = await listBotGuilds();
-      guildIds = guilds.map((guild) => guild.id);
-    }
-
-    if (guildIds.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No Discord servers found. Invite the bot to a server or set DISCORD_GUILD_IDS in the MCP .env file.",
-          },
-        ],
-      };
+      return textResponse(
+        "Please provide a Discord guild/server ID, or set DISCORD_GUILD_IDS in the MCP .env file so I know which server's channels to list.",
+        true
+      );
     }
 
     const sections = await Promise.all(
       guildIds.map(async (currentGuildId) => {
-        const channels = await discordRequest<DiscordChannel[]>(
-          `/guilds/${currentGuildId}/channels`
-        );
+        const data = await executeDiscordBotTool("DISCORDBOT_LIST_GUILD_CHANNELS", {
+          guild_id: currentGuildId,
+        });
+        const channels = extractArray<DiscordChannel>(data);
 
         const filteredChannels = text_only
           ? channels.filter(isTextLikeChannel)
@@ -346,14 +658,9 @@ server.tool(
       })
     );
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `${sections.join("\n\n---\n\n")}\n\nNote: Discord channel-level permissions can still block reading or sending even when a channel is listed.`,
-        },
-      ],
-    };
+    return textResponse(
+      `${sections.join("\n\n---\n\n")}\n\nNote: Discord channel-level permissions can still block reading or sending even when a channel is listed.`
+    );
   }
 );
 
@@ -364,7 +671,16 @@ server.tool(
     channel_id: z
       .string()
       .min(1)
-      .describe("Discord channel ID to read messages from."),
+      .optional()
+      .describe("Discord channel ID to read messages from. If omitted, provide channel_name and a configured or explicit guild_id."),
+    channel_name: z
+      .string()
+      .optional()
+      .describe("Discord channel name, such as general. Used when channel_id is not provided."),
+    guild_id: z
+      .string()
+      .optional()
+      .describe("Optional Discord server/guild ID used to resolve channel_name. If omitted, uses DISCORD_GUILD_IDS from the MCP environment."),
     limit: z
       .number()
       .int()
@@ -393,31 +709,52 @@ server.tool(
   },
   async ({
     channel_id,
+    channel_name,
+    guild_id,
     limit = DEFAULT_MESSAGE_LIMIT,
     before,
     after,
     around,
     author_filter,
   }) => {
-    const params = new URLSearchParams({
-      limit: String(clampMessageLimit(limit)),
+    const connection = await ensureDiscordBotConnection();
+
+    if (connection.type === "needs_auth") {
+      return textResponse(connection.text);
+    }
+
+    const resolvedChannelId = await resolveChannelId({
+      channelId: channel_id,
+      channelName: channel_name,
+      guildId: guild_id,
     });
 
+    if (!resolvedChannelId) {
+      return textResponse(
+        "I need either a Discord channel ID, or a channel name with DISCORD_GUILD_IDS configured in the MCP .env file. For example, set DISCORD_GUILD_IDS to your server ID so I can resolve #general automatically.",
+        true
+      );
+    }
+
+    const args: Record<string, unknown> = {
+      channel_id: resolvedChannelId,
+      limit: clampMessageLimit(limit),
+    };
+
     if (before) {
-      params.set("before", before);
+      args.before = before;
     }
 
     if (after) {
-      params.set("after", after);
+      args.after = after;
     }
 
     if (around) {
-      params.set("around", around);
+      args.around = around;
     }
 
-    const messages = await discordRequest<DiscordMessage[]>(
-      `/channels/${channel_id}/messages?${params.toString()}`
-    );
+    const data = await executeDiscordBotTool("DISCORDBOT_LIST_MESSAGES", args);
+    const messages = extractArray<DiscordMessage>(data);
 
     const filteredMessages = messages.filter((message) =>
       messageMatchesAuthorFilter(message, author_filter)
@@ -426,13 +763,11 @@ server.tool(
     const text =
       filteredMessages.length > 0
         ? filteredMessages.map(formatMessageForAgent).join("\n\n---\n\n")
-        : `No Discord messages found in channel ${channel_id}${
+        : `No Discord messages found in channel ${resolvedChannelId}${
             author_filter ? ` matching author filter "${author_filter}"` : ""
           }.`;
 
-    return {
-      content: [{ type: "text", text }],
-    };
+    return textResponse(text);
   }
 );
 
@@ -443,7 +778,16 @@ server.tool(
     channel_id: z
       .string()
       .min(1)
-      .describe("Discord channel ID where the message will be sent."),
+      .optional()
+      .describe("Discord channel ID where the message will be sent. If omitted, provide channel_name and a configured or explicit guild_id."),
+    channel_name: z
+      .string()
+      .optional()
+      .describe("Discord channel name, such as general. Used when channel_id is not provided."),
+    guild_id: z
+      .string()
+      .optional()
+      .describe("Optional Discord server/guild ID used to resolve channel_name. If omitted, uses DISCORD_GUILD_IDS from the MCP environment."),
     content: z
       .string()
       .min(1)
@@ -455,27 +799,46 @@ server.tool(
       .describe("Whether this message should be sent as text-to-speech. Defaults to false."),
     allowed_mentions: mentionPolicySchema,
   },
-  async ({ channel_id, content, tts = false, allowed_mentions = "none" }) => {
-    const message = await discordRequest<DiscordMessage>(
-      `/channels/${channel_id}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          content,
-          tts,
-          allowed_mentions: allowedMentionsForPolicy(allowed_mentions),
-        }),
-      }
-    );
+  async ({
+    channel_id,
+    channel_name,
+    guild_id,
+    content,
+    tts = false,
+    allowed_mentions = "none",
+  }) => {
+    const connection = await ensureDiscordBotConnection();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Sent Discord message ${message.id} to channel ${message.channel_id} at ${message.timestamp}:\n${message.content}`,
-        },
-      ],
-    };
+    if (connection.type === "needs_auth") {
+      return textResponse(connection.text);
+    }
+
+    const resolvedChannelId = await resolveChannelId({
+      channelId: channel_id,
+      channelName: channel_name,
+      guildId: guild_id,
+    });
+
+    if (!resolvedChannelId) {
+      return textResponse(
+        "I need either a Discord channel ID, or a channel name with DISCORD_GUILD_IDS configured in the MCP .env file before I can send the message.",
+        true
+      );
+    }
+
+    const data = await executeDiscordBotTool("DISCORDBOT_CREATE_MESSAGE", {
+      channel_id: resolvedChannelId,
+      content,
+      tts,
+      allowed_mentions: allowedMentionsForPolicy(allowed_mentions),
+    });
+    const message = extractObject<DiscordMessage>(data);
+
+    return textResponse(
+      message
+        ? `Sent Discord message ${message.id} to channel ${message.channel_id} at ${message.timestamp}:\n${message.content}`
+        : `Sent Discord message to channel ${resolvedChannelId}.\n\n${stringifyData(data)}`
+    );
   }
 );
 
@@ -486,7 +849,16 @@ server.tool(
     channel_id: z
       .string()
       .min(1)
-      .describe("Discord channel ID containing the message being replied to."),
+      .optional()
+      .describe("Discord channel ID containing the message being replied to. If omitted, provide channel_name and a configured or explicit guild_id."),
+    channel_name: z
+      .string()
+      .optional()
+      .describe("Discord channel name, such as general. Used when channel_id is not provided."),
+    guild_id: z
+      .string()
+      .optional()
+      .describe("Optional Discord server/guild ID used to resolve channel_name. If omitted, uses DISCORD_GUILD_IDS from the MCP environment."),
     message_id: z
       .string()
       .min(1)
@@ -498,31 +870,50 @@ server.tool(
       .describe("Exact Discord reply content to send. Discord messages are limited to 2000 characters."),
     allowed_mentions: mentionPolicySchema,
   },
-  async ({ channel_id, message_id, content, allowed_mentions = "none" }) => {
-    const message = await discordRequest<DiscordMessage>(
-      `/channels/${channel_id}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          content,
-          message_reference: {
-            message_id,
-            channel_id,
-            fail_if_not_exists: true,
-          },
-          allowed_mentions: allowedMentionsForPolicy(allowed_mentions),
-        }),
-      }
-    );
+  async ({
+    channel_id,
+    channel_name,
+    guild_id,
+    message_id,
+    content,
+    allowed_mentions = "none",
+  }) => {
+    const connection = await ensureDiscordBotConnection();
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Sent Discord reply ${message.id} to message ${message_id} in channel ${message.channel_id} at ${message.timestamp}:\n${message.content}`,
-        },
-      ],
-    };
+    if (connection.type === "needs_auth") {
+      return textResponse(connection.text);
+    }
+
+    const resolvedChannelId = await resolveChannelId({
+      channelId: channel_id,
+      channelName: channel_name,
+      guildId: guild_id,
+    });
+
+    if (!resolvedChannelId) {
+      return textResponse(
+        "I need either a Discord channel ID, or a channel name with DISCORD_GUILD_IDS configured in the MCP .env file before I can reply.",
+        true
+      );
+    }
+
+    const data = await executeDiscordBotTool("DISCORDBOT_CREATE_MESSAGE", {
+      channel_id: resolvedChannelId,
+      content,
+      message_reference: {
+        message_id,
+        channel_id: resolvedChannelId,
+        fail_if_not_exists: true,
+      },
+      allowed_mentions: allowedMentionsForPolicy(allowed_mentions),
+    });
+    const message = extractObject<DiscordMessage>(data);
+
+    return textResponse(
+      message
+        ? `Sent Discord reply ${message.id} to message ${message_id} in channel ${message.channel_id} at ${message.timestamp}:\n${message.content}`
+        : `Sent Discord reply to message ${message_id} in channel ${resolvedChannelId}.\n\n${stringifyData(data)}`
+    );
   }
 );
 

@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@composio/core": "^0.9.0",
     "@modelcontextprotocol/sdk": "latest",
     "zod": "latest"
   },
